@@ -311,3 +311,157 @@ def apply_correction(
         raise FlowError("更正后流向存在环，无法重算汇水表")
 
     return new_edges, new_accum, affected
+
+
+# --------------------------------------------------------------------------- #
+# 跨界复核：两份合法流向图的集水区交叉检查
+# --------------------------------------------------------------------------- #
+BoundaryEdge = tuple[Cell, Cell]
+"""跨界边 = (源格, 下游格) 的有序对；在新图上沿流向跨过原集水区边界。"""
+
+
+def outlet_of_each_cell(edges: Edges) -> dict[Cell, Cell]:
+    """功能图（每点出度 <= 1、无环）上每格最终汇入的出口格。
+
+    沿下游链记忆化计算：每个格只在首次访问时推进一次，整体 O(n)，
+    出口格映射到自身。调用前两图均已通过 :func:`validate_edges`。
+    """
+    outlet: dict[Cell, Cell] = {}
+    for start in edges:
+        if start in outlet:
+            continue
+        path: list[Cell] = []
+        node: Optional[Cell] = start
+        while node is not None and node not in outlet:
+            path.append(node)
+            node = edges[node]
+        target = node if node is not None else path[-1]
+        # node 为 None 只可能发生在 path 最后一个格是出口时
+        root = outlet.get(target, target)
+        for cell in path:
+            outlet[cell] = root
+    return outlet
+
+
+def boundary_edges_along_new_flow(
+    new_edges: Edges, old_outlet: dict[Cell, Cell]
+) -> dict[Cell, tuple[Optional[BoundaryEdge], Optional[BoundaryEdge]]]:
+    """在新流路（按新图下游方向）上，找每格路径中跨界边的**首条与末条**。
+
+    跨界判定完全基于原集水区：边 ``u -> v`` 满足
+    ``old_outlet[u] != old_outlet[v]`` 即为跨界边。
+    每个格只记忆化一次（连同其新下游链），整体 O(n)，不会为每格重走整条
+    流路；同一格的流路即使反复跨界，也只保留首条出界边与末条回界边各一条。
+
+    返回 ``格 -> (首条跨界边, 末条跨界边)``；路径上没有跨界边时值为
+    ``(None, None)``。
+    """
+    first: dict[Cell, Optional[BoundaryEdge]] = {}
+    last: dict[Cell, Optional[BoundaryEdge]] = {}
+    for start in new_edges:
+        if start in first:
+            continue
+        path: list[Cell] = []
+        node: Optional[Cell] = start
+        while node is not None and node not in first:
+            path.append(node)
+            node = new_edges[node]
+        if node is None:
+            tail_first: Optional[BoundaryEdge] = None
+            tail_last: Optional[BoundaryEdge] = None
+        else:
+            tail_first, tail_last = first[node], last[node]
+        # 逆序回填：path[-1] 的下游已算过（tail_*），逐格向回传播
+        for cell in reversed(path):
+            downstream = new_edges[cell]
+            if downstream is not None and old_outlet[cell] != old_outlet[downstream]:
+                edge: BoundaryEdge = (cell, downstream)
+                first[cell] = edge  # 本格跨界边比下游路径上的任何边都早
+                last[cell] = tail_last if tail_last is not None else edge
+                tail_first, tail_last = first[cell], last[cell]
+            else:
+                first[cell], last[cell] = tail_first, tail_last
+    return {cell: (first[cell], last[cell]) for cell in new_edges}
+
+
+def compare_catchments(
+    old_edges: Edges, new_edges: Edges
+) -> dict:
+    """核对两份**已校验合法**且格点集合相同的流向图。
+
+    原集水区：沿原图（``old_edges``）汇入同一出口的全部格点。
+    命中条件（两者同时成立）：
+
+    1. 出口未变：格点在新图上仍汇入它在原图上的那个出口；
+    2. 新流路曾离开原集水区：新图流路上存在跨界边
+       （边两端格点的原出口不同）。
+
+    命中格按 ``(原出口, 首条出界边, 末条回界边)`` 分组；同一格反复跨界
+    只计一次。整体 O(n)，不为任何格重走整条流路。
+    """
+    old_outlet = outlet_of_each_cell(old_edges)
+    boundary = boundary_edges_along_new_flow(new_edges, old_outlet)
+    new_outlet = outlet_of_each_cell(new_edges)
+
+    groups: dict[tuple[Cell, BoundaryEdge, BoundaryEdge], list[Cell]] = {}
+    outlet_changed = 0
+    no_crossing = 0
+    for cell in old_edges:
+        if new_outlet[cell] != old_outlet[cell]:
+            outlet_changed += 1  # 新图换了出口：不属于“出口未变”的复核范围
+            continue
+        first_edge, last_edge = boundary[cell]
+        if first_edge is None:
+            no_crossing += 1  # 出口未变且从未离开原集水区
+            continue
+        # 路径终止于原出口且存在跨界边：首条必为出界边，末条必为回界边
+        key = (old_outlet[cell], first_edge, last_edge)
+        groups.setdefault(key, []).append(cell)
+
+    def edge_json(edge: BoundaryEdge) -> dict:
+        return {
+            "from_row": edge[0][0],
+            "from_col": edge[0][1],
+            "to_row": edge[1][0],
+            "to_col": edge[1][1],
+        }
+
+    group_list = []
+    for (outlet, first_edge, last_edge), cells in groups.items():
+        group_list.append(
+            {
+                "outlet": {"row": outlet[0], "col": outlet[1]},
+                "first_exit": edge_json(first_edge),
+                "last_return": edge_json(last_edge),
+                "cell_count": len(cells),
+                "cells": [
+                    {"row": cell[0], "col": cell[1]}
+                    for cell in sorted(cells)
+                ],
+            }
+        )
+    group_list.sort(
+        key=lambda g: (
+            (g["outlet"]["row"], g["outlet"]["col"]),
+            (
+                g["first_exit"]["from_row"],
+                g["first_exit"]["from_col"],
+                g["first_exit"]["to_row"],
+                g["first_exit"]["to_col"],
+            ),
+            (
+                g["last_return"]["from_row"],
+                g["last_return"]["from_col"],
+                g["last_return"]["to_row"],
+                g["last_return"]["to_col"],
+            ),
+        )
+    )
+    return {
+        "cell_count": len(old_edges),
+        "group_count": len(group_list),
+        "flagged_cell_count": sum(len(cells) for cells in groups.values()),
+        "outlet_changed_count": outlet_changed,
+        "no_crossing_count": no_crossing,
+        "groups": group_list,
+    }

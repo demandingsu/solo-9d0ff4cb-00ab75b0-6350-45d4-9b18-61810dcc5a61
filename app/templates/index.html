@@ -56,6 +56,16 @@
     code { background: #eff1f3; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     @media (max-width: 820px) { .grid2 { grid-template-columns: 1fr; } }
+    .group-row { cursor: pointer; }
+    .group-row:hover { background: #f6f8fa; }
+    .detail-row td { background: #fbfdff; text-align: left; }
+    .detail-box { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; white-space: pre-wrap; }
+    .edge-tag { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #eff1f3; padding: 1px 5px; border-radius: 4px; }
+    .warn { color: #9a6700; }
+    select { font-size: 13px; border: 1px solid var(--border); border-radius: 6px;
+      padding: 7px 10px; background: #fff; max-width: 100%; }
   </style>
 </head>
 <body>
@@ -96,7 +106,33 @@
   </div>
 
   <div class="card">
-    <h2>③ 当前数据与下载</h2>
+    <h2>③ 跨界复核（上传新流向 CSV，与现行整图核对）</h2>
+    <label for="check-file">待核对 CSV（表头 row,col,down_row,down_col；两图均须合法且格点完全相同）</label>
+    <input type="file" id="check-file" accept=".csv,text/csv">
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="btn-check">开始核对</button>
+      <span class="muted">核对只读现行图并另存一份快照报告，<b>不会改动现行流向和汇水表</b>。</span>
+    </div>
+    <div class="hint">
+      命中口径：格点在新图上仍汇入<b>原出口</b>，但新流路上存在跨界边（边的两端属于不同原集水区）。
+      按「原出口 + 首条出界边 + 末条回界边」分组；同一格反复跨界只计一次。
+      报告保存核对当时的两图快照，此后现行图被更正也不影响已生成的报告。
+    </div>
+    <div id="check-summary" class="hint" style="margin-top:10px"></div>
+    <div class="table-box" style="margin-top:10px">
+      <table>
+        <thead>
+          <tr><th>原出口</th><th>首条出界边</th><th>末条回界边</th><th>格数</th><th></th></tr>
+        </thead>
+        <tbody id="group-body">
+          <tr><td colspan="5" class="muted">尚未核对</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>④ 当前数据与下载</h2>
     <div class="row" style="margin-bottom:12px">
       <span class="pill" id="stat-count">格点数：-</span>
       <button id="btn-refresh">刷新</button>
@@ -115,6 +151,25 @@
       </table>
     </div>
     <div class="hint" id="trunc-note"></div>
+  </div>
+
+  <div class="card">
+    <h2>复核报告（核对当时两图的不可变快照）</h2>
+    <div class="row" style="margin-bottom:12px">
+      <select id="report-select"><option value="">加载历史报告…</option></select>
+      <button id="btn-load-report">查看报告</button>
+      <a class="btn" id="link-old" href="#" hidden>下载报告内现行图快照</a>
+      <a class="btn" id="link-new" href="#" hidden>下载报告内上传图快照</a>
+    </div>
+    <div id="report-meta" class="hint"></div>
+    <div class="table-box" style="margin-top:10px" id="report-box" hidden>
+      <table>
+        <thead>
+          <tr><th>原出口</th><th>首条出界边</th><th>末条回界边</th><th>格数</th><th></th></tr>
+        </thead>
+        <tbody id="report-group-body"></tbody>
+      </table>
+    </div>
   </div>
 
   <div class="card">
@@ -213,6 +268,112 @@ $("btn-correct").addEventListener("click", async () => {
 $("btn-refresh").addEventListener("click", () => refreshState().catch(
   e => showMessage(false, "✘ 刷新失败：" + e.message)));
 
+// --------------------------------------------------------------------- //
+// 跨界复核
+// --------------------------------------------------------------------- //
+function esc(v) {
+  return String(v).replace(/[&<>"']/g, ch => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
+function cellText(c) { return "(" + c.row + "," + c.col + ")"; }
+function edgeText(e) {
+  return "(" + e.from_row + "," + e.from_col + ") → (" + e.to_row + "," + e.to_col + ")";
+}
+function renderGroups(body, groups) {
+  if (!groups.length) {
+    body.innerHTML = '<tr><td colspan="5" class="muted">没有命中格：不存在“出口未变但新流路离开原集水区”的格点。</td></tr>';
+    return;
+  }
+  body.innerHTML = "";
+  groups.forEach((g, i) => {
+    const tr = document.createElement("tr");
+    tr.className = "group-row";
+    tr.innerHTML =
+      '<td><span class="edge-tag">' + esc(cellText(g.outlet)) + "</span></td>" +
+      '<td><span class="edge-tag">' + esc(edgeText(g.first_exit)) + "</span></td>" +
+      '<td><span class="edge-tag">' + esc(edgeText(g.last_return)) + "</span></td>" +
+      "<td><b>" + g.cell_count + "</b></td>" +
+      '<td class="muted">点击展开 ▸</td>';
+    const detail = document.createElement("tr");
+    detail.className = "detail-row";
+    detail.hidden = true;
+    detail.innerHTML =
+      '<td colspan="5"><div class="detail-box">' +
+      esc(g.cells.map(cellText).join("  ")) +
+      "</div></td>";
+    tr.addEventListener("click", () => {
+      detail.hidden = !detail.hidden;
+      tr.cells[4].textContent = detail.hidden ? "点击展开 ▸" : "收起 ▴";
+    });
+    body.appendChild(tr);
+    body.appendChild(detail);
+  });
+}
+function showCheckResult(data) {
+  $("check-summary").innerHTML =
+    "报告 #" + data.report_id + "（已保存快照）｜总格点 " + data.cell_count +
+    "｜复核分组 <b>" + data.group_count + "</b> 个｜命中格点 <b>" +
+    data.flagged_cell_count + "</b> 个｜出口已变更（不在复核范围）" +
+    data.outlet_changed_count + " 格｜出口未变且未跨界 " +
+    data.no_crossing_count + " 格";
+  renderGroups($("group-body"), data.groups);
+}
+
+$("btn-check").addEventListener("click", async () => {
+  const f = $("check-file").files[0];
+  if (!f) { showMessage(false, "请先选择待核对的 CSV 文件"); return; }
+  const fd = new FormData();
+  fd.append("file", f);
+  try {
+    const resp = await fetch("/api/check", { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || "核对失败");
+    showMessage(true, "✔ " + data.message + "\n现行流向与汇水表未做任何改动。");
+    showCheckResult(data);
+    loadReportList();
+  } catch (e) {
+    showMessage(false, "✘ " + e.message);
+  }
+});
+
+async function loadReportList() {
+  const resp = await fetch("/api/reports");
+  const data = await resp.json();
+  const sel = $("report-select");
+  sel.innerHTML = '<option value="">加载历史报告…</option>';
+  data.reports.forEach(r => {
+    const opt = document.createElement("option");
+    opt.value = r.id;
+    opt.textContent = "#" + r.id + "  " + r.created_at +
+      "｜分组 " + r.group_count + "｜命中 " + r.flagged_cell_count +
+      "｜出口变更 " + r.outlet_changed_count;
+    sel.appendChild(opt);
+  });
+}
+
+$("btn-load-report").addEventListener("click", async () => {
+  const id = $("report-select").value;
+  if (!id) { showMessage(false, "请先选择一份报告"); return; }
+  try {
+    const resp = await fetch("/api/reports/" + id);
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || "报告加载失败");
+    $("report-meta").textContent =
+      "报告 #" + data.report_id + " 生成于 " + data.created_at +
+      "（UTC），分组与明细均按核对当时的两张图显示；即使现行图此后被更正，本报告也不变。";
+    $("report-box").hidden = false;
+    renderGroups($("report-group-body"), data.result.groups);
+    $("link-old").hidden = false;
+    $("link-new").hidden = false;
+    $("link-old").href = "/api/reports/" + id + "/snapshot/old";
+    $("link-new").href = "/api/reports/" + id + "/snapshot/new";
+  } catch (e) {
+    showMessage(false, "✘ " + e.message);
+  }
+});
+
+loadReportList().catch(e => showMessage(false, "✘ 历史报告加载失败：" + e.message));
 refreshState().catch(e => showMessage(false, "✘ 初始化失败：" + e.message));
 </script>
 </body>

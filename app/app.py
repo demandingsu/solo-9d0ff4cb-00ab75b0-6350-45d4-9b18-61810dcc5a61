@@ -21,15 +21,20 @@ from .db import (
     get_db,
     has_data,
     import_flow,
+    list_check_reports,
     list_corrections,
     load_accum,
+    load_check_report,
     load_edges,
+    save_check_report,
 )
 from .flow import (
     Cell,
     FlowError,
+    compare_catchments,
     dump_flow_csv,
     parse_flow_csv,
+    validate_edges,
 )
 
 
@@ -254,6 +259,139 @@ def create_app(db_path: Optional[str] = None) -> Flask:
     @app.errorhandler(409)
     def handle_409(exc):
         return jsonify({"ok": False, "error": exc.description}), 409
+
+    @app.errorhandler(404)
+    def handle_404(exc):
+        return jsonify({"ok": False, "error": exc.description}), 404
+
+    # ---------------------------------------------------------------- #
+    # 跨界复核：上传图与现行图核对，结果以不可变快照报告保存
+    # ---------------------------------------------------------------- #
+    @app.post("/api/check")
+    def api_check():
+        upload = request.files.get("file")
+        if upload is None:
+            raise FlowError("缺少上传文件字段 file（CSV）")
+        try:
+            text = upload.read().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise FlowError("CSV 必须是 UTF-8 编码")
+        new_edges = parse_flow_csv(text)
+        if not new_edges:
+            raise FlowError("CSV 中没有任何格点记录")
+        # 上传图自身必须合法（下游存在、四邻域、无环）
+        validate_edges(new_edges)
+
+        conn = db()
+        try:
+            if not has_data(conn):
+                raise FlowError("尚无现行流向数据，请先导入一份流向 CSV 再核对")
+            old_edges = load_edges(conn)  # 现行图由导入/更正事务保证合法
+
+            old_cells, new_cells = set(old_edges), set(new_edges)
+            if old_cells != new_cells:
+                missing = sorted(new_cells - old_cells)
+                extra = sorted(old_cells - new_cells)
+                parts = [
+                    "两图格点集合不一致，无法核对："
+                    f"现行图 {len(old_cells)} 格，上传图 {len(new_edges)} 格"
+                ]
+                if missing:
+                    parts.append(
+                        "上传图多出的格点："
+                        + "、".join(f"({r},{c})" for r, c in missing[:10])
+                        + ("…" if len(missing) > 10 else "")
+                    )
+                if extra:
+                    parts.append(
+                        "上传图缺少的格点："
+                        + "、".join(f"({r},{c})" for r, c in extra[:10])
+                        + ("…" if len(extra) > 10 else "")
+                    )
+                raise FlowError("；".join(parts))
+
+            result = compare_catchments(old_edges, new_edges)
+            # 只读了 cells 表；保存动作只写 check_reports，现行流向/汇水表不变
+            report_id = save_check_report(conn, old_edges, new_edges, result)
+            result["ok"] = True
+            result["report_id"] = report_id
+            result["message"] = (
+                f"核对完成：{result['group_count']} 个复核分组，"
+                f"涉及 {result['flagged_cell_count']} 个格点；"
+                f"出口已变更 {result['outlet_changed_count']} 格，"
+                f"未跨界 {result['no_crossing_count']} 格"
+            )
+            return jsonify(result)
+        finally:
+            conn.close()
+
+    @app.get("/api/reports")
+    def api_reports():
+        conn = db()
+        try:
+            return jsonify({"ok": True, "reports": list_check_reports(conn)})
+        finally:
+            conn.close()
+
+    @app.get("/api/reports/<int:report_id>")
+    def api_report_detail(report_id: int):
+        conn = db()
+        try:
+            report = load_check_report(conn, report_id)
+            if report is None:
+                abort(404, description=f"复核报告 #{report_id} 不存在或已被清理")
+            result = report["result"]
+            return jsonify(
+                {
+                    "ok": True,
+                    "report_id": report["id"],
+                    "created_at": report["created_at"],
+                    "result": result,
+                    "old_edges": [
+                        {
+                            "row": cell[0],
+                            "col": cell[1],
+                            "down_row": None if d is None else d[0],
+                            "down_col": None if d is None else d[1],
+                        }
+                        for cell, d in sorted(report["old_edges"].items())
+                    ],
+                    "new_edges": [
+                        {
+                            "row": cell[0],
+                            "col": cell[1],
+                            "down_row": None if d is None else d[0],
+                            "down_col": None if d is None else d[1],
+                        }
+                        for cell, d in sorted(report["new_edges"].items())
+                    ],
+                }
+            )
+        finally:
+            conn.close()
+
+    @app.get("/api/reports/<int:report_id>/snapshot/<which>")
+    def api_report_snapshot(report_id: int, which: str):
+        if which not in ("old", "new"):
+            abort(404, description="快照类型只能是 old 或 new")
+        conn = db()
+        try:
+            report = load_check_report(conn, report_id)
+            if report is None:
+                abort(404, description=f"复核报告 #{report_id} 不存在或已被清理")
+            edges = report["old_edges"] if which == "old" else report["new_edges"]
+            label = "current" if which == "old" else "uploaded"
+            return Response(
+                dump_flow_csv(edges),
+                mimetype="text/csv; charset=utf-8",
+                headers={
+                    "Content-Disposition": (
+                        f"attachment; filename=report_{report_id}_{label}.csv"
+                    )
+                },
+            )
+        finally:
+            conn.close()
 
     return app
 

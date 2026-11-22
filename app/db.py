@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -42,7 +43,19 @@ CREATE TABLE IF NOT EXISTS corrections (
     affected   TEXT NOT NULL,           -- JSON 快照
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- 跨界复核报告：只追加、从不更新。报告内嵌核对当时两张图的完整快照，
+-- 因此现行流向/汇水表事后被更正也不影响已打开的报告。
+CREATE TABLE IF NOT EXISTS check_reports (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    old_edges   TEXT NOT NULL,          -- 核对时现行图快照 JSON
+    new_edges   TEXT NOT NULL,          -- 上传图快照 JSON
+    result      TEXT NOT NULL,          -- compare_catchments 结果 JSON
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
+
+# 仅保留最近这么多份复核报告，更早的随新报告生成而清理
+MAX_CHECK_REPORTS = 50
 
 
 def get_db(db_path: str | Path, check_same_thread: bool = True) -> sqlite3.Connection:
@@ -140,8 +153,6 @@ def apply_batch(
     - 通过后在一个事务内只写受影响格，汇水表与流向同事务更新；
     - 保存失败一律回滚，旧流向和旧汇水表照常可用。
     """
-    import json
-
     with _WRITE_LOCK:
         old_edges = load_edges(conn)
         if not old_edges:
@@ -199,3 +210,96 @@ def list_corrections(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.
             (limit,),
         )
     )
+
+
+# --------------------------------------------------------------------------- #
+# 跨界复核报告（只追加的快照，不触碰 cells 表）
+# --------------------------------------------------------------------------- #
+def _edges_to_json(edges: Edges) -> str:
+    return json.dumps(
+        [
+            (
+                cell[0],
+                cell[1],
+                None if downstream is None else downstream[0],
+                None if downstream is None else downstream[1],
+            )
+            for cell, downstream in edges.items()
+        ]
+    )
+
+
+def _edges_from_json(text: str) -> Edges:
+    edges: Edges = {}
+    for r, c, dr, dc in json.loads(text):
+        edges[(r, c)] = None if dr is None else (dr, dc)
+    return edges
+
+
+def save_check_report(
+    conn: sqlite3.Connection,
+    old_edges: Edges,
+    new_edges: Edges,
+    result: dict,
+) -> int:
+    """把一次跨界复核的两图快照与结果作为不可变报告保存，返回报告 ID。
+
+    只写 ``check_reports`` 表，现行流向表 ``cells`` 不做任何改动；
+    保存失败时整体回滚，不留半截报告。
+    """
+    try:
+        with _WRITE_LOCK, conn:
+            cur = conn.execute(
+                "INSERT INTO check_reports(old_edges, new_edges, result)"
+                " VALUES(?, ?, ?)",
+                (_edges_to_json(old_edges), _edges_to_json(new_edges),
+                 json.dumps(result, ensure_ascii=False)),
+            )
+            report_id = int(cur.lastrowid)
+            conn.execute(
+                "DELETE FROM check_reports WHERE id NOT IN"
+                " (SELECT id FROM check_reports ORDER BY id DESC LIMIT ?)",
+                (MAX_CHECK_REPORTS,),
+            )
+            return report_id
+    except sqlite3.Error as exc:
+        raise FlowError(f"复核报告保存失败，已回滚：{exc}")
+
+
+def list_check_reports(conn: sqlite3.Connection) -> list[dict]:
+    """报告摘要列表（不含可能很大的两图快照与分组明细）。"""
+    rows = conn.execute(
+        "SELECT id, result, created_at FROM check_reports ORDER BY id DESC"
+    ).fetchall()
+    reports = []
+    for row in rows:
+        result = json.loads(row["result"])
+        reports.append(
+            {
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "cell_count": result["cell_count"],
+                "group_count": result["group_count"],
+                "flagged_cell_count": result["flagged_cell_count"],
+                "outlet_changed_count": result["outlet_changed_count"],
+            }
+        )
+    return reports
+
+
+def load_check_report(conn: sqlite3.Connection, report_id: int) -> Optional[dict]:
+    """取一份报告的完整内容（含核对当时的两图快照）；不存在返回 None。"""
+    row = conn.execute(
+        "SELECT id, old_edges, new_edges, result, created_at"
+        " FROM check_reports WHERE id = ?",
+        (report_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "created_at": row["created_at"],
+        "old_edges": _edges_from_json(row["old_edges"]),
+        "new_edges": _edges_from_json(row["new_edges"]),
+        "result": json.loads(row["result"]),
+    }
